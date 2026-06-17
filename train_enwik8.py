@@ -9,7 +9,8 @@ from __future__ import annotations
 #     "fire",
 #     "accelerate",
 #     "x-transformers",
-#     "rotary-embedding-torch"
+#     "rotary-embedding-torch",
+#     "einops"
 # ]
 # ///
 
@@ -21,6 +22,7 @@ import gzip
 import random
 import tqdm
 import numpy as np
+from collections import namedtuple
 
 import torch
 import fire
@@ -32,11 +34,14 @@ from torch import Tensor
 from torch.utils.data import DataLoader, Dataset
 from accelerate import Accelerator
 from rotary_embedding_torch import RotaryEmbedding
+from einops import rearrange
 
 from poly_attention import PolyAttention, NPolyAttention
 from x_transformers import FeedForward
 
 # helpers
+
+Cache = namedtuple('Cache', ['layer_caches', 'seq_len'])
 
 def exists(v):
     return v is not None
@@ -149,11 +154,9 @@ class PolyLM(Module):
 
         past_seq_len = 0
         if exists(cache):
-            first_layer_cache = cache[0]
-            if exists(first_layer_cache):
-                past_seq_len = first_layer_cache[0].shape[-2]
+            cache, past_seq_len = cache.layer_caches, cache.seq_len
 
-        pos = torch.arange(past_seq_len, past_seq_len + seq_len, device = device)
+        pos = torch.arange(seq_len, device = device) + past_seq_len
         rotary_pos_emb = self.rotary_emb(pos)
 
         new_caches = []
@@ -167,9 +170,9 @@ class PolyLM(Module):
         logits = self.to_logits(embed)
 
         if not return_loss:
-            return (logits, new_caches) if return_cache else logits
+            return (logits, Cache(new_caches, past_seq_len + seq_len)) if return_cache else logits
 
-        loss = F.cross_entropy(logits.transpose(1, 2), labels)
+        loss = F.cross_entropy(rearrange(logits, 'b n c -> b c n'), labels)
         return loss
 
 class TextSamplerDataset(Dataset):

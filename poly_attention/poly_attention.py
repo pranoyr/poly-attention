@@ -140,7 +140,7 @@ class Order2PolyAttention(Module):
             lse23, msg = lse23_step, msg_step
 
         scores12 = scores12 + rearrange(lse23, 'b h j -> b h 1 j')
-        
+
         attn12 = scores12.softmax(dim = -1)
 
         out = einsum('b h i j, b h j d -> b h i d', attn12, msg)

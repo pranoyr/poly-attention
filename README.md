@@ -22,8 +22,9 @@ attn = PolyAttention(
     causal = False
 )
 
-x = torch.randn(1, 1024, 512)
-out = attn(x) # (1, 1024, 512)
+tokens = torch.randn(1, 1024, 512)
+
+out = attn(tokens) # (1, 1024, 512)
 ```
 
 ## Appreciation

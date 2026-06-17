@@ -5,6 +5,7 @@
 #     "wandb",
 #     "fire",
 #     "accelerate",
+#     "rotary-embedding-torch",
 #     "x-transformers"
 # ]
 # ///
@@ -178,8 +179,7 @@ def train_model(
     optimizer = Adam(model.parameters(), lr = lr)
     model, optimizer = accelerator.prepare(model, optimizer)
 
-    if accelerator.is_main_process:
-        print(f"Testing {model_name} with {layers} layers...")
+    accelerator.print(f"Testing {model_name} with {layers} layers...")
 
     best_acc = 0.0
     for epoch in range(epochs):
@@ -223,7 +223,11 @@ def train_model(
             ))
 
             if divisible_by(epoch + 1, 10):
-                print(f"  Epoch {epoch+1:04d} | Loss: {loss.item():.4f} | Accuracy: {acc:.4f}")
+                accelerator.print(f"  Epoch {epoch+1:04d} | Loss: {loss.item():.4f} | Accuracy: {acc:.4f}")
+
+        if acc >= 1.0:
+            accelerator.print(f"Accuracy reached 1.0 at epoch {epoch + 1}, stopping early.")
+            break
 
     if accelerator.is_main_process:
         wandb.finish()
@@ -245,8 +249,7 @@ def main(
 ):
     accelerator = Accelerator()
 
-    if accelerator.is_main_process:
-        print(f"Running on {accelerator.device} with {layers} layers.")
+    accelerator.print(f"Running on {accelerator.device} with {layers} layers.")
 
     train_fn = partial(
         train_model,
@@ -267,8 +270,7 @@ def main(
     acc_poly = train_fn("PolyAttention", use_poly = True)
     acc_base = train_fn("BaseSelfAttention", use_poly = False)
 
-    if accelerator.is_main_process:
-        print(f"Final Best Accuracies ({layers} Layers, Order {order}) -> Base: {acc_base:.4f} | Poly: {acc_poly:.4f}")
+    accelerator.print(f"Final Best Accuracies ({layers} Layers, Order {order}) -> Base: {acc_base:.4f} | Poly: {acc_poly:.4f}")
 
 if __name__ == '__main__':
     fire.Fire(main)

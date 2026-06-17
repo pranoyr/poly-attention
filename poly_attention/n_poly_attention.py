@@ -84,10 +84,10 @@ class NPolyAttention(Module):
         device = x.device
 
         q1, gates, *kv_chunks = [self.split_heads(t) for t in (*self.to_q_gates(x).chunk(2, dim = -1), *self.to_kv(x).chunk(self.order * 2, dim = -1))]
-        
+
         q_rest = kv_chunks[:self.order]
         v_rest = kv_chunks[self.order:]
-        
+
         qs = [q1] + q_rest
         vs = v_rest
 
@@ -125,16 +125,16 @@ class NPolyAttention(Module):
         # aggregate from right to left
 
         v_bar = vs[-1]
-        
+
         current_scores_k = scores[-1]
         scores12 = scores[0]
-        
+
         for k in range(self.order - 1, 0, -1):
             lse_k = torch.logsumexp(current_scores_k, dim = -1)
             attn_k = current_scores_k.softmax(dim = -1)
-            
+
             msg = einsum('b h j k, b h k d -> b h j d', attn_k, v_bar)
-            
+
             if k > 1:
                 v_bar = vs[k - 1] * msg
                 current_scores_k = scores[k - 1] + rearrange(lse_k, 'b h j -> b h 1 j')

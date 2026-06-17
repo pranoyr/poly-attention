@@ -146,7 +146,7 @@ class PolyLM(Module):
         seq_len, device = x.shape[1], x.device
 
         x = self.token_emb(x)
-        
+
         past_seq_len = 0
         if exists(cache):
             first_layer_cache = cache[0]

@@ -87,7 +87,7 @@ def test_n_poly_attention(causal, kv_heads, order):
 
 def test_poly_attention_kv_cache():
     attn = PolyAttention(dim = 128, heads = 4, dim_head = 32, causal = True)
-    
+
     x = torch.randn(2, 5, 128)
 
     out_parallel = attn(x)

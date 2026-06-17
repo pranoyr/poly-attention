@@ -13,7 +13,7 @@ from einops.layers.torch import Rearrange
 
 # constants
 
-LinearNoBias = partial(nn.Linear, bias=False)
+LinearNoBias = partial(nn.Linear, bias = False)
 
 # helper functions
 
@@ -43,6 +43,9 @@ class PolyAttention(Module):
         eps = 1e-9
     ):
         super().__init__()
+        self.eps = eps
+        self.scale = dim_head ** -0.5
+
         kv_heads = default(kv_heads, heads)
         assert divisible_by(heads, kv_heads), 'heads must be divisible by kv_heads'
 
@@ -54,12 +57,15 @@ class PolyAttention(Module):
 
         self.causal = causal
         self.softclamp_value = softclamp_value
-        self.scale = dim_head ** -0.5
-        self.eps = eps
 
         self.split_heads = Rearrange('b n (h d) -> b h n d', h = heads)
         self.split_kv_heads = Rearrange('b n (h d) -> b h n d', h = kv_heads)
         self.merge_heads = Rearrange('b h n d -> b n (h d)')
+
+        self.is_gqa = heads != kv_heads
+
+        if self.is_gqa:
+            self.num_rep = heads // kv_heads
 
         self.to_q_gates = LinearNoBias(dim, dim_inner * 2)
         self.to_kv = LinearNoBias(dim, dim_inner_kv * 4)
@@ -89,9 +95,8 @@ class PolyAttention(Module):
         q2 = self.q2_norm(q2)
         q3 = self.q3_norm(q3)
 
-        if self.heads != self.kv_heads:
-            num_rep = self.heads // self.kv_heads
-            q2, q3, v2, v3 = (repeat(t, 'b g n d -> b (g r) n d', r = num_rep) for t in (q2, q3, v2, v3))
+        if self.is_gqa:
+            q2, q3, v2, v3 = (repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in (q2, q3, v2, v3))
 
         q_left = stack((q1, q2))
         q_right = stack((q2, q3))
@@ -132,7 +137,7 @@ class PolyAttention(Module):
 
         denominator = einsum('b h i j, b h j d -> b h i d', exp_scores12, exp_scores23_sum)
 
-        out = unnormalized_out / denominator.clamp(min = self.eps)
+        out = out / denominator.clamp_min(self.eps)
 
         # gate
 

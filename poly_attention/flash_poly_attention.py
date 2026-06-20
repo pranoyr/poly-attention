@@ -141,6 +141,14 @@ def _poly_flash_fwd_kernel(
     l_ptrs = Lse + off_hz * N_CTX_Q + offs_m
     tl.store(l_ptrs, m_i + tl.math.log(l_i), mask=offs_m < N_CTX_Q)
 
+@triton.autotune(
+    configs=[
+        triton.Config({'BLOCK_M': 32, 'BLOCK_N': 32}, num_stages=1, num_warps=4),
+        triton.Config({'BLOCK_M': 64, 'BLOCK_N': 32}, num_stages=1, num_warps=4),
+    ],
+    key=['N_CTX_Q', 'N_CTX_K', 'BLOCK_DMODEL'],
+    reset_to_zero=['DQ']
+)
 @triton.jit
 def _poly_flash_bwd_kernel(
     Q, K, V, sm_scale,
@@ -361,10 +369,7 @@ class PolyFlashAttention(torch.autograd.Function):
         dmsg = torch.zeros_like(msg)
         dlse23 = torch.zeros_like(lse23)
 
-        BLOCK_M = 32
-        BLOCK_N = 32
-
-        grid_bwd = (triton.cdiv(seq_len, BLOCK_N), batch * heads, 1)
+        grid_bwd = lambda META: (triton.cdiv(seq_len, META['BLOCK_N']), batch * heads, 1)
 
         # Pass 2 Backward
         _poly_flash_bwd_kernel[grid_bwd](
@@ -377,7 +382,7 @@ class PolyFlashAttention(torch.autograd.Function):
             msg.stride(0), msg.stride(1), msg.stride(2), msg.stride(3),
             lse23.stride(0), lse23.stride(1), lse23.stride(2),
             batch, heads, seq_len, seq_len,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=dim,
+            BLOCK_DMODEL=dim,
             IS_CAUSAL=is_causal, HAS_BIAS=True, HAS_DLSE=False, SOFTCLAMP_VAL=softclamp_val
         )
 
@@ -396,7 +401,7 @@ class PolyFlashAttention(torch.autograd.Function):
             v3.stride(0), v3.stride(1), v3.stride(2), v3.stride(3),
             0, 0, 0,
             batch, heads, seq_len, seq_len,
-            BLOCK_M=BLOCK_M, BLOCK_N=BLOCK_N, BLOCK_DMODEL=dim,
+            BLOCK_DMODEL=dim,
             IS_CAUSAL=is_causal, HAS_BIAS=False, HAS_DLSE=True, SOFTCLAMP_VAL=softclamp_val
         )
 

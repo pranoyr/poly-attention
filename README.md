@@ -1,5 +1,5 @@
 
-## Poly Attention (wip)
+## Poly Attention
 
 Implementation of <a href="https://arxiv.org/abs/2602.02422">Poly-Attention</a>, a general scheme for higher-order self-attention
 

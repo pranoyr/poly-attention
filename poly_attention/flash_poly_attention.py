@@ -16,19 +16,21 @@ import triton.language.extra.cuda.libdevice as libdevice
 @triton.jit
 def _poly_flash_fwd_kernel(
     Q, K, V, sm_scale,
-    Bias,
+    Bias, Mask,
     Out, Lse,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
     stride_bz, stride_bh, stride_bn,
+    stride_mz, stride_mn,
     stride_oz, stride_oh, stride_om, stride_on,
     Z, H, N_CTX_Q, N_CTX_K,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     HAS_BIAS: tl.constexpr,
-    SOFTCLAMP_VAL: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    SOFTCLAMP_VALUE: tl.constexpr,
 ):
     # get program ids
 
@@ -87,8 +89,8 @@ def _poly_flash_fwd_kernel(
 
         # softclamp if needed
 
-        if SOFTCLAMP_VAL is not None:
-            sim = SOFTCLAMP_VAL * libdevice.tanh(sim / SOFTCLAMP_VAL)
+        if SOFTCLAMP_VALUE is not None:
+            sim = SOFTCLAMP_VALUE * libdevice.tanh(sim / SOFTCLAMP_VALUE)
 
         # apply bias
 
@@ -98,6 +100,11 @@ def _poly_flash_fwd_kernel(
             sim += bias[None, :]
 
         # mask causal and sequence lengths
+
+        if HAS_MASK:
+            mask_ptrs = Mask + off_z * stride_mz + offs_n_curr * stride_mn
+            mask_val = tl.load(mask_ptrs, mask=offs_n_curr < N_CTX_K, other=0.0)
+            sim = tl.where(mask_val[None, :], sim, float("-inf"))
 
         if IS_CAUSAL:
             causal_mask = offs_m[:, None] >= offs_n_curr[None, :]
@@ -153,19 +160,21 @@ def _poly_flash_fwd_kernel(
 def _poly_flash_bwd_kernel(
     Q, K, V, sm_scale,
     Out, DO, Lse, DLse,
-    Bias, DBias,
+    Bias, DBias, Mask,
     DQ, DK, DV,
     stride_qz, stride_qh, stride_qm, stride_qk,
     stride_kz, stride_kh, stride_kn, stride_kk,
     stride_vz, stride_vh, stride_vn, stride_vk,
     stride_bz, stride_bh, stride_bn,
+    stride_mz, stride_mn,
     Z, H, N_CTX_Q, N_CTX_K,
     BLOCK_M: tl.constexpr, BLOCK_DMODEL: tl.constexpr,
     BLOCK_N: tl.constexpr,
     IS_CAUSAL: tl.constexpr,
     HAS_BIAS: tl.constexpr,
     HAS_DLSE: tl.constexpr,
-    SOFTCLAMP_VAL: tl.constexpr,
+    HAS_MASK: tl.constexpr,
+    SOFTCLAMP_VALUE: tl.constexpr,
 ):
     # get program ids
 
@@ -235,14 +244,19 @@ def _poly_flash_bwd_kernel(
         # softclamp if needed
 
         sim_tanh = sim
-        if SOFTCLAMP_VAL is not None:
-            sim_tanh = SOFTCLAMP_VAL * libdevice.tanh(sim / SOFTCLAMP_VAL)
+        if SOFTCLAMP_VALUE is not None:
+            sim_tanh = SOFTCLAMP_VALUE * libdevice.tanh(sim / SOFTCLAMP_VALUE)
 
         sim_soft = sim_tanh
         if HAS_BIAS:
             bias_ptrs = Bias + b_offset + offs_n * stride_bn
             bias = tl.load(bias_ptrs, mask=offs_n < N_CTX_K, other=0.0)
             sim_soft += bias[None, :]
+
+        if HAS_MASK:
+            mask_ptrs = Mask + off_z * stride_mz + offs_n * stride_mn
+            mask_val = tl.load(mask_ptrs, mask=offs_n < N_CTX_K, other=0.0)
+            sim_soft = tl.where(mask_val[None, :], sim_soft, float("-inf"))
 
         if IS_CAUSAL:
             causal_mask = offs_m[:, None] >= offs_n[None, :]
@@ -267,8 +281,8 @@ def _poly_flash_bwd_kernel(
         if HAS_BIAS:
             dbias += tl.sum(ds, axis=0)
 
-        if SOFTCLAMP_VAL is not None:
-            ds = ds * (1.0 - (sim_tanh / SOFTCLAMP_VAL) * (sim_tanh / SOFTCLAMP_VAL))
+        if SOFTCLAMP_VALUE is not None:
+            ds = ds * (1.0 - (sim_tanh / SOFTCLAMP_VALUE) * (sim_tanh / SOFTCLAMP_VALUE))
 
         # accumulate gradients
 
@@ -299,11 +313,18 @@ def _poly_flash_bwd_kernel(
 
 class PolyFlashAttention(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, q1, q2, q3, v3, softclamp_val=None, is_causal=True):
+    def forward(ctx, q1, q2, q3, v3, mask=None, softclamp_value=None, is_causal=True):
         q1 = q1.contiguous()
         q2 = q2.contiguous()
         q3 = q3.contiguous()
         v3 = v3.contiguous()
+
+        has_mask = mask is not None
+        if has_mask:
+            mask = mask.contiguous()
+            stride_mz, stride_mn = mask.stride(0), mask.stride(1)
+        else:
+            stride_mz, stride_mn = 0, 0
 
         batch, heads, seq_len, dim = q1.shape
         sm_scale = dim ** -0.5
@@ -320,15 +341,16 @@ class PolyFlashAttention(torch.autograd.Function):
         # Pass 1
         _poly_flash_fwd_kernel[grid](
             q2, q3, v3, sm_scale,
-            None, msg, lse23,
+            None, mask, msg, lse23,
             q2.stride(0), q2.stride(1), q2.stride(2), q2.stride(3),
             q3.stride(0), q3.stride(1), q3.stride(2), q3.stride(3),
             v3.stride(0), v3.stride(1), v3.stride(2), v3.stride(3),
             0, 0, 0,
+            stride_mz, stride_mn,
             msg.stride(0), msg.stride(1), msg.stride(2), msg.stride(3),
             batch, heads, seq_len, seq_len,
             BLOCK_DMODEL=dim,
-            IS_CAUSAL=is_causal, HAS_BIAS=False, SOFTCLAMP_VAL=softclamp_val
+            IS_CAUSAL=is_causal, HAS_BIAS=False, HAS_MASK=has_mask, SOFTCLAMP_VALUE=softclamp_value
         )
 
         # Pass 2
@@ -337,32 +359,39 @@ class PolyFlashAttention(torch.autograd.Function):
 
         _poly_flash_fwd_kernel[grid](
             q1, q2, msg, sm_scale,
-            lse23, out, lse12,
+            lse23, mask, out, lse12,
             q1.stride(0), q1.stride(1), q1.stride(2), q1.stride(3),
             q2.stride(0), q2.stride(1), q2.stride(2), q2.stride(3),
             msg.stride(0), msg.stride(1), msg.stride(2), msg.stride(3),
             lse23.stride(0), lse23.stride(1), lse23.stride(2),
+            stride_mz, stride_mn,
             out.stride(0), out.stride(1), out.stride(2), out.stride(3),
             batch, heads, seq_len, seq_len,
             BLOCK_DMODEL=dim,
-            IS_CAUSAL=is_causal, HAS_BIAS=True, SOFTCLAMP_VAL=softclamp_val
+            IS_CAUSAL=is_causal, HAS_BIAS=True, HAS_MASK=has_mask, SOFTCLAMP_VALUE=softclamp_value
         )
 
-        PolyFlashAttention.saved_lse12 = lse12
-        ctx.save_for_backward(q1, q2, q3, v3, msg, lse23, out, lse12)
+        ctx.saved_lse12 = lse12
+        ctx.save_for_backward(q1, q2, q3, v3, msg, lse23, out, lse12, mask)
         ctx.sm_scale = sm_scale
-        ctx.softclamp_val = softclamp_val
+        ctx.softclamp_value = softclamp_value
         ctx.is_causal = is_causal
         return out
 
     @staticmethod
     def backward(ctx, dout):
         dout = dout.contiguous()
-        q1, q2, q3, v3, msg, lse23, out, lse12 = ctx.saved_tensors
+        q1, q2, q3, v3, msg, lse23, out, lse12, mask = ctx.saved_tensors
         batch, heads, seq_len, dim = q2.shape
         sm_scale = ctx.sm_scale
-        softclamp_val = ctx.softclamp_val
+        softclamp_value = ctx.softclamp_value
         is_causal = ctx.is_causal
+
+        has_mask = mask is not None
+        if has_mask:
+            stride_mz, stride_mn = mask.stride(0), mask.stride(1)
+        else:
+            stride_mz, stride_mn = 0, 0
 
         dq1 = torch.zeros_like(q1)
         dq2_part2 = torch.zeros_like(q2)
@@ -375,15 +404,16 @@ class PolyFlashAttention(torch.autograd.Function):
         _poly_flash_bwd_kernel[grid_bwd](
             q1, q2, msg, sm_scale,
             out, dout, lse12, None,
-            lse23, dlse23,
+            lse23, dlse23, mask,
             dq1, dq2_part2, dmsg,
             q1.stride(0), q1.stride(1), q1.stride(2), q1.stride(3),
             q2.stride(0), q2.stride(1), q2.stride(2), q2.stride(3),
             msg.stride(0), msg.stride(1), msg.stride(2), msg.stride(3),
             lse23.stride(0), lse23.stride(1), lse23.stride(2),
+            stride_mz, stride_mn,
             batch, heads, seq_len, seq_len,
             BLOCK_DMODEL=dim,
-            IS_CAUSAL=is_causal, HAS_BIAS=True, HAS_DLSE=False, SOFTCLAMP_VAL=softclamp_val
+            IS_CAUSAL=is_causal, HAS_BIAS=True, HAS_DLSE=False, HAS_MASK=has_mask, SOFTCLAMP_VALUE=softclamp_value
         )
 
         # Pass 1 Backward
@@ -394,20 +424,21 @@ class PolyFlashAttention(torch.autograd.Function):
         _poly_flash_bwd_kernel[grid_bwd](
             q2, q3, v3, sm_scale,
             msg, dmsg, lse23, dlse23,
-            None, None,
+            None, None, mask,
             dq2_part1, dq3, dv3,
             q2.stride(0), q2.stride(1), q2.stride(2), q2.stride(3),
             q3.stride(0), q3.stride(1), q3.stride(2), q3.stride(3),
             v3.stride(0), v3.stride(1), v3.stride(2), v3.stride(3),
             0, 0, 0,
+            stride_mz, stride_mn,
             batch, heads, seq_len, seq_len,
             BLOCK_DMODEL=dim,
-            IS_CAUSAL=is_causal, HAS_BIAS=False, HAS_DLSE=True, SOFTCLAMP_VAL=softclamp_val
+            IS_CAUSAL=is_causal, HAS_BIAS=False, HAS_DLSE=True, HAS_MASK=has_mask, SOFTCLAMP_VALUE=softclamp_value
         )
 
         dq2 = dq2_part1 + dq2_part2
 
-        return dq1, dq2, dq3, dv3, None, None
+        return dq1, dq2, dq3, dv3, None, None, None
 
-def flash_poly_attention(q1, q2, q3, v3, softclamp_val=None, is_causal=True):
-    return PolyFlashAttention.apply(q1, q2, q3, v3, softclamp_val, is_causal)
+def flash_poly_attention(q1, q2, q3, v3, mask=None, softclamp_value=None, is_causal=True):
+    return PolyFlashAttention.apply(q1, q2, q3, v3, mask, softclamp_value, is_causal)

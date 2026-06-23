@@ -161,9 +161,9 @@ from poly_attention.poly_attention import reference_poly_attention
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = 'cuda required')
 @pytest.mark.parametrize('causal', (False, True))
-@pytest.mark.parametrize('softclamp_val', (None, 20.0))
+@pytest.mark.parametrize('softclamp_value', (None, 20.0))
 @pytest.mark.parametrize('seq_len', (31, 32, 127, 128))
-def test_flash_poly_attention(causal, softclamp_val, seq_len):
+def test_flash_poly_attention(causal, softclamp_value, seq_len):
     from poly_attention.flash_poly_attention import flash_poly_attention
 
     torch.manual_seed(42)
@@ -174,11 +174,11 @@ def test_flash_poly_attention(causal, softclamp_val, seq_len):
 
     q1, q2, q3, v3 = pt_tensors
 
-    out_pt, _, _ = reference_poly_attention(q1, q2, q2, q3, v3, softclamp_val = softclamp_val, causal = causal)
+    out_pt, _, _ = reference_poly_attention(q1, q2, q2, q3, v3, softclamp_value = softclamp_value, causal = causal)
     dout = torch.randn_like(out_pt)
     out_pt.backward(dout)
 
-    out_tr = flash_poly_attention(*tensors, softclamp_val = softclamp_val, is_causal = causal)
+    out_tr = flash_poly_attention(*tensors, softclamp_value = softclamp_value, is_causal = causal)
     out_tr.backward(dout)
 
     assert torch.allclose(out_pt, out_tr, atol = 1e-2), f'fwd max diff: {(out_pt - out_tr).abs().max().item()}'
@@ -188,9 +188,9 @@ def test_flash_poly_attention(causal, softclamp_val, seq_len):
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason = 'cuda required')
 @pytest.mark.parametrize('causal', (False, True))
-@pytest.mark.parametrize('softclamp_val', (None, 20.0))
+@pytest.mark.parametrize('softclamp_value', (None, 20.0))
 @pytest.mark.parametrize('seq_len', (31, 64))
-def test_poly_attention_e2e(causal, softclamp_val, seq_len):
+def test_poly_attention_e2e(causal, softclamp_value, seq_len):
     from poly_attention.poly_attention import Order2PolyAttention
 
     torch.manual_seed(42)
@@ -200,11 +200,11 @@ def test_poly_attention_e2e(causal, softclamp_val, seq_len):
     x_pt = x.clone().detach().requires_grad_(True)
 
     module_pt = Order2PolyAttention(
-        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_val, use_flash_kernel = False
+        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_value, use_flash_kernel = False
     ).cuda()
 
     module_tr = Order2PolyAttention(
-        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_val, use_flash_kernel = True
+        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_value, use_flash_kernel = True
     ).cuda()
 
     module_tr.load_state_dict(module_pt.state_dict())
@@ -234,3 +234,58 @@ def test_compile_poly_attention():
 
     assert out.shape == (2, 64, 128)
     assert not torch.isnan(out).any()
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason = 'cuda required')
+@pytest.mark.parametrize('causal', (False, True))
+@pytest.mark.parametrize('softclamp_value', (None, 20.0))
+@pytest.mark.parametrize('seq_len', (31, 64))
+def test_poly_attention_mask_equality(causal, softclamp_value, seq_len):
+    from poly_attention.poly_attention import Order2PolyAttention
+    from poly_attention import NPolyAttention
+
+    torch.manual_seed(42)
+    dim = 64
+    heads = 4
+    x = torch.randn(2, seq_len, dim, requires_grad = True, device = 'cuda')
+    x_pt = x.clone().detach().requires_grad_(True)
+
+    mask = torch.ones(2, seq_len, dtype=torch.bool, device='cuda')
+    mask[:, seq_len // 2:] = False
+
+    module_pt = Order2PolyAttention(
+        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_value, use_flash_kernel = False
+    ).cuda()
+
+    module_tr = Order2PolyAttention(
+        dim = dim, heads = heads, causal = causal, softclamp_value = softclamp_value, use_flash_kernel = True
+    ).cuda()
+
+    module_n = NPolyAttention(
+        dim = dim, order = 2, heads = heads, causal = causal, softclamp_value = softclamp_value
+    ).cuda()
+
+    state_dict = module_pt.state_dict()
+    module_tr.load_state_dict(state_dict)
+
+    n_state_dict = state_dict.copy()
+    n_state_dict['q_norms.0.weight'] = n_state_dict.pop('q1_norm.weight')
+    n_state_dict['q_norms.1.weight'] = n_state_dict.pop('q2_norm.weight')
+    n_state_dict['q_norms.2.weight'] = n_state_dict.pop('q3_norm.weight')
+    module_n.load_state_dict(n_state_dict, strict=False)
+
+    out_pt = module_pt(x_pt, mask=mask)
+    dout = torch.randn_like(out_pt)
+    out_pt.backward(dout)
+
+    out_tr = module_tr(x, mask=mask)
+    out_tr.backward(dout)
+
+    x_n = x.clone().detach().requires_grad_(True)
+    out_n = module_n(x_n, mask=mask)
+    out_n.backward(dout)
+
+    assert torch.allclose(out_pt, out_tr, atol = 1e-2), f'fwd max diff: {(out_pt - out_tr).abs().max().item()}'
+    assert torch.allclose(x_pt.grad, x.grad, atol = 1e-2), f'grad max diff: {(x_pt.grad - x.grad).abs().max().item()}'
+
+    assert torch.allclose(out_pt, out_n, atol = 1e-2), f'n-poly fwd max diff: {(out_pt - out_n).abs().max().item()}'
+    assert torch.allclose(x_pt.grad, x_n.grad, atol = 1e-2), f'n-poly grad max diff: {(x_pt.grad - x_n.grad).abs().max().item()}'

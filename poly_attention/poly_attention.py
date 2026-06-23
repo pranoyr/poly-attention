@@ -40,7 +40,7 @@ def softclamp(x, clamp_value):
 def reference_poly_attention(
     q1, q2_pass1, q2_pass2, q3, v3,
     mask = None,
-    softclamp_val = None,
+    softclamp_value = None,
     causal = False,
     cache = None
 ):
@@ -51,8 +51,8 @@ def reference_poly_attention(
 
     sim23 = einsum('b h i d, b h j d -> b h i j', q2_pass1, q3) * scale
 
-    if exists(softclamp_val):
-        sim23 = softclamp(sim23, softclamp_val)
+    if exists(softclamp_value):
+        sim23 = softclamp(sim23, softclamp_value)
 
     mask_value = -torch.finfo(sim23.dtype).max
 
@@ -82,8 +82,8 @@ def reference_poly_attention(
 
     sim12 = einsum('b h i d, b h j d -> b h i j', q1, q2_pass2) * scale
 
-    if exists(softclamp_val):
-        sim12 = softclamp(sim12, softclamp_val)
+    if exists(softclamp_value):
+        sim12 = softclamp(sim12, softclamp_value)
 
     if causal and not has_cache:
         i, j = sim12.shape[-2:]
@@ -234,14 +234,14 @@ class Order2PolyAttention(Module):
             exists(flash_poly_attention) and
             not has_cache and
             not return_cache and
-            not exists(mask) and
             q1.is_cuda
         )
 
         if can_use_flash:
             out = flash_poly_attention(
                 q1, q2_right, q3, v3_full,
-                softclamp_val = self.softclamp_value,
+                mask = mask,
+                softclamp_value = self.softclamp_value,
                 is_causal = self.causal
             )
             lse23_step, msg_step = None, None
@@ -249,7 +249,7 @@ class Order2PolyAttention(Module):
             out, lse23_step, msg_step = reference_poly_attention(
                 q1, q2_left, q2_right, q3_full, v3_full,
                 mask = mask,
-                softclamp_val = self.softclamp_value,
+                softclamp_value = self.softclamp_value,
                 causal = self.causal,
                 cache = cache
             )

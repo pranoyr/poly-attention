@@ -97,17 +97,17 @@ class NPolyAttention(Module):
         kv_chunks = self.split_kv(self.to_kv(x))
         q_rest, v_rest = kv_chunks.chunk(2, dim = 0)
 
-        qs = [q1, *q_rest]
-        vs = [*v_rest]
+        qs = (q1, *q_rest)
+        vs = tuple(v_rest)
 
-        qs = [norm(q) for norm, q in zip(self.q_norms, qs)]
+        qs = tuple(norm(q) for norm, q in zip(self.q_norms, qs))
 
         if exists(rotary_pos_emb):
-            qs = [apply_rotary_emb(rotary_pos_emb, q) for q in qs]
+            qs = tuple(apply_rotary_emb(rotary_pos_emb, q) for q in qs)
 
         if self.is_gqa:
-            qs[1:] = [repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in qs[1:]]
-            vs = [repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in vs]
+            qs = (qs[0], *(repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in qs[1:]))
+            vs = tuple(repeat(t, 'b g n d -> b (g r) n d', r = self.num_rep) for t in vs)
 
         q_left = stack(qs[:-1])
         q_right = stack(qs[1:])
@@ -118,7 +118,8 @@ class NPolyAttention(Module):
         # scores
 
         scores = einsum('... i d, ... j d -> ... i j', q_left, q_right) * self.scale
-        scores = softclamp(scores, self.softclamp_value)
+        if exists(self.softclamp_value):
+            scores = softclamp(scores, self.softclamp_value)
 
         mask_value = -torch.finfo(scores.dtype).max
 

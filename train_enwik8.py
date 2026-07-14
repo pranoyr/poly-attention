@@ -252,7 +252,8 @@ def main(
 
     # training
 
-    pbar = tqdm.tqdm(range(num_batches + 1), mininterval = 1.0, desc = "training", ncols=120)
+    pbar = tqdm.tqdm(range(num_batches + 1), mininterval = 1.0, desc = "training", dynamic_ncols = True)
+
     for i in pbar:
         model.train()
 
